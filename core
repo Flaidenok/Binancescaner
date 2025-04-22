@@ -1,0 +1,281 @@
+Binance_scanner.py
+import ccxt
+import numpy as np
+import talib
+import logging
+import time
+from datetime import datetime
+from typing import List, Dict, Optional
+from threading import Thread
+from config.settings import SIGNAL_FILTERS, TIMEFRAME_SETTINGS
+
+
+class BinanceScanner:
+    def __init__(self, api_key: str, api_secret: str):
+        self.logger = logging.getLogger('BinanceScanner')
+        self.logger.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        ch = logging.StreamHandler()
+        ch.setFormatter(formatter)
+        self.logger.addHandler(ch)
+
+        self.exchange = ccxt.binance({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'},
+            'timeout': 10000
+        })
+
+        self.running = False
+        self.ui_callback = None
+        self.timeframe = '5m'
+        self.last_signals = {}
+
+        # Инициализируем параметры сканирования
+        self.min_price_change = 0.3
+        self.min_volume_ratio = 1.5
+        self.min_strength = 2
+        self.tp_multiplier = 1.01
+        self.sl_multiplier = 0.99
+
+        # Устанавливаем настройки для выбранного таймфрейма
+        self.update_timeframe_settings('5m')
+
+    def update_timeframe_settings(self, timeframe: str):
+        """Обновление параметров сканирования для выбранного таймфрейма"""
+        if timeframe in TIMEFRAME_SETTINGS:
+            settings = TIMEFRAME_SETTINGS[timeframe]
+            self.min_price_change = settings['min_price_change']
+            self.min_volume_ratio = settings['min_volume_ratio']
+            self.min_strength = settings['min_strength']
+            self.tp_multiplier = settings['tp_multiplier']
+            self.sl_multiplier = settings['sl_multiplier']
+            self.timeframe = timeframe
+            self.logger.info(f"Обновлены настройки для таймфрейма {timeframe}")
+        else:
+            self.logger.warning(f"Настройки для таймфрейма {timeframe} не найдены")
+
+    def get_candles(self, symbol: str, timeframe: str = None, limit: int = 100) -> Optional[np.ndarray]:
+        """Получение свечных данных с Binance"""
+        try:
+            candles = self.exchange.fetch_ohlcv(symbol, timeframe or self.timeframe, limit=limit)
+            if len(candles) < 20:  # Минимум 20 свечей для анализа
+                self.logger.warning(f"Недостаточно данных для {symbol}")
+                return None
+
+            # Преобразуем в numpy array (Open, High, Low, Close, Volume)
+            ohlc = np.array([c[1:] for c in candles], dtype=np.float64)
+
+            return ohlc
+        except Exception as e:
+            self.logger.error(f"Ошибка получения данных {symbol}: {str(e)}")
+            return None
+
+    def analyze_signals(self, candles: np.ndarray, symbol: str) -> Optional[Dict]:
+        """Анализ свечных данных на наличие сигналов"""
+        if candles is None or len(candles) < 20:
+            print(f"Недостаточно данных для {symbol}")
+            return None
+
+        opens, highs, lows, closes, volumes = candles[:, 0], candles[:, 1], candles[:, 2], candles[:, 3], candles[:, 4]
+
+        # 1. Базовые индикаторы
+        ema_8 = talib.EMA(closes, timeperiod=8)
+        ema_21 = talib.EMA(closes, timeperiod=21)
+        trend_up = ema_8[-1] > ema_21[-1]
+
+        rsi = talib.RSI(closes, timeperiod=14)
+        rsi_value = rsi[-1]
+
+        # 2. Свечные паттерны (упрощённый набор)
+        engulfing = talib.CDLENGULFING(opens, highs, lows, closes)[-1]
+        hammer = talib.CDLHAMMER(opens, highs, lows, closes)[-1]
+        shooting_star = talib.CDLSHOOTINGSTAR(opens, highs, lows, closes)[-1]
+
+        # 3. Изменение цены и объёма
+        price_change = ((closes[-1] - closes[-3]) / closes[-3]) * 100
+        volume_avg = np.mean(volumes[-20:])
+        volume_ok = volumes[-1] > volume_avg * 1.1  # +10% от среднего
+
+        # 4. Условия для BUY (упрощённые но рабочие)
+        if (engulfing > 0 or hammer > 0) and rsi_value < 65:
+            strength = 3 if engulfing > 0 else 2
+            return {
+                'time': datetime.now().strftime("%H:%M:%S"),
+                'symbol': symbol,
+                'pattern': 'ENGULFING' if engulfing > 0 else 'HAMMER',
+                'strength': strength,
+                'price': closes[-1],
+                'change': round(price_change, 2),
+                'action': 'BUY',
+                'tp': closes[-1] * 1.01,
+                'sl': closes[-1] * 0.99
+            }
+
+        # 5. Условия для SELL (упрощённые но рабочие)
+        if (engulfing < 0 or shooting_star < 0) and rsi_value > 35:
+            strength = 3 if engulfing < 0 else 2
+            return {
+                'time': datetime.now().strftime("%H:%M:%S"),
+                'symbol': symbol,
+                'pattern': 'ENGULFING' if engulfing < 0 else 'SHOOTING_STAR',
+                'strength': strength,
+                'price': closes[-1],
+                'change': round(price_change, 2),
+                'action': 'SELL',
+                'tp': closes[-1] * 0.99,
+                'sl': closes[-1] * 1.01
+            }
+
+        print(
+            f"Нет сигналов для {symbol} (RSI: {rsi_value:.1f}, Паттерны: ENG:{engulfing}, HAM:{hammer}, SHOT:{shooting_star})")
+        return None
+
+    def _get_pattern_name(self, engulfing, pattern1, pattern2, harami, doji, is_buy):
+        """Определение названия паттерна"""
+        if engulfing > 0 if is_buy else engulfing < 0:
+            return 'ENGULFING'
+        elif pattern1 > 0 if is_buy else pattern1 < 0:
+            return 'HAMMER' if is_buy else 'SHOOTING_STAR'
+        elif pattern2 and pattern2 > 0 if is_buy else pattern2 < 0:
+            return 'MORNING_STAR' if is_buy else 'EVENING_STAR'
+        elif harami > 0 if is_buy else harami < 0:
+            return 'HARAMI'
+        elif doji > 0:
+            return 'DOJI'
+        return 'UNKNOWN'
+
+    def start_scanning(self, symbols: List[str], timeframe: str = '5m'):
+        """Основной цикл сканирования"""
+        self.timeframe = timeframe
+        self.running = True
+
+        self.logger.info(f"Начато сканирование {len(symbols)} пар на {timeframe}")
+
+        while self.running:
+            start_time = time.time()
+
+            for symbol in symbols:
+                if not self.running:
+                    break
+
+                try:
+                    # Получаем свечи
+                    candles = self.get_candles(symbol, timeframe, limit=50)
+
+                    # Анализируем сигналы
+                    signal = self.analyze_signals(candles, symbol)
+
+                    if signal:
+                        self.logger.info(f"Найден сигнал: {signal['action']} {signal['symbol']}")
+                        if self.ui_callback:
+                            self.ui_callback(signal)
+
+                except Exception as e:
+                    self.logger.error(f"Ошибка при сканировании {symbol}: {str(e)}")
+                    time.sleep(1)
+
+            # Пауза между циклами сканирования
+            elapsed = time.time() - start_time
+            sleep_time = max(1, 10 - elapsed)  # 10 секунд между циклами
+            time.sleep(sleep_time)
+
+
+    def stop(self):
+        """Остановка сканирования"""
+        self.running = False
+        try:
+            self.exchange.close()
+        except:
+            pass
+        self.logger.info("Сканирование остановлено")
+
+report_generator.py
+import pandas as pd
+from fpdf import FPDF
+import os
+from datetime import datetime
+
+class ReportGenerator:
+    def __init__(self, scanner_instance):
+        self.scanner = scanner_instance
+        self.report_data = {
+            'signals': [],
+            'performance_metrics': {},
+            'timeframe': None,
+            'symbols': None
+        }
+
+    def add_signal(self, signal_data):
+        self.report_data['signals'].append(signal_data)
+
+    def set_scanning_params(self, timeframe, symbols):
+        self.report_data['timeframe'] = timeframe
+        self.report_data['symbols'] = symbols
+
+    def generate_performance_metrics(self):
+        if not self.report_data['signals']:
+            return {}
+
+        df = pd.DataFrame(self.report_data['signals'])
+        metrics = {
+            'total_signals': len(df),
+            'buy_signals': len(df[df['action'] == 'BUY']),
+            'sell_signals': len(df[df['action'] == 'SELL']),
+            'avg_strength': df['strength'].mean(),
+            'strong_signals': len(df[df['strength'] >= 3]),
+            'timeframe': self.report_data['timeframe'],
+            'symbols_count': len(self.report_data['symbols']) if self.report_data['symbols'] else 0,
+            'first_signal': df['time'].min() if len(df) > 0 else 'N/A',
+            'last_signal': df['time'].max() if len(df) > 0 else 'N/A'
+        }
+        self.report_data['performance_metrics'] = metrics
+        return metrics
+
+    def generate_pdf_report(self, filename):
+        try:
+            if not self.report_data.get('signals'):
+                raise Exception("Нет данных о сигналах для отчета")
+
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+
+            # Заголовок
+            pdf.cell(200, 10, txt="Binance Signals Report", ln=1, align='C')
+
+            # Основная информация
+            pdf.cell(200, 8, txt=f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ln=1)
+            pdf.cell(200, 8, txt=f"Таймфрейм: {self.report_data['timeframe']}", ln=1)
+            pdf.cell(200, 8, txt=f"Количество пар: {len(self.report_data['symbols']) if self.report_data['symbols'] else 0}", ln=1)
+            pdf.ln(10)
+
+            # Таблица сигналов
+            headers = ['Time', 'Pair', 'Signal', 'Change %']
+            col_widths = [40, 30, 30, 40]
+
+            for i, header in enumerate(headers):
+                pdf.cell(col_widths[i], 8, txt=header, border=1, align='C')
+            pdf.ln()
+
+            for signal in self.report_data['signals'][-20:]:
+                time = signal.get('time', '')
+                symbol = signal.get('symbol', '')
+                action = 'BUY' if signal.get('action') == 'BUY' else 'SELL'
+                change = f"{signal.get('change', 0):+.2f}%"
+
+                pdf.cell(col_widths[0], 8, txt=time, border=1)
+                pdf.cell(col_widths[1], 8, txt=symbol, border=1)
+                pdf.cell(col_widths[2], 8, txt=action, border=1)
+                pdf.cell(col_widths[3], 8, txt=change, border=1, align='C')
+                pdf.ln()
+
+            pdf.output(filename)
+            return filename
+
+        except Exception as e:
+            error_file = f"{filename}_FAILED.txt"
+            with open(error_file, 'w') as f:
+                f.write(f"Ошибка генерации отчета:\n{str(e)}")
+            raise Exception(f"Отчет не создан. Подробности в {error_file}")
