@@ -1,0 +1,12 @@
+ccxt==4.2.85
+numpy==1.26.4
+TA-Lib==0.6.3
+plyer==2.1.0
+Pillow==10.1.0
+matplotlib==3.8.3
+ttkbootstrap==1.10.1
+python-dateutil==2.8.2
+requests==2.31.0
+pandas==2.1.1
+fpdf2==2.7.4
+pystray==0.19.4
