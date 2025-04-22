@@ -1,0 +1,438 @@
+main_window.py
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from threading import Thread
+from plyer import notification
+import platform
+import os
+from datetime import datetime
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from core.binance_scanner import BinanceScanner
+from core.report_generator import ReportGenerator
+from config.settings import BINANCE_API, SYMBOLS, TIMEFRAMES, NOTIFICATIONS, UI_SETTINGS, BACKGROUND_SETTINGS
+
+
+class BinanceScannerApp:
+    def __init__(self, root):
+        self.root = root
+        self.style = ttk.Style(theme='darkly')
+        self.root.title("Binance Scanner Pro v3.4.1")
+        self.root.geometry("1400x900")
+
+        self.selected_symbols = set(UI_SETTINGS['default_filter'])
+        self.symbol_vars = {}
+        self.background_mode = False
+        self.report_generator = ReportGenerator(self)
+
+        self._setup_ui()
+        self._center_window()
+        self._setup_bindings()
+        self._setup_tray_icon()
+
+        self.scanner = BinanceScanner(BINANCE_API['api_key'], BINANCE_API['secret'])
+        self.scanner.ui_callback = self._handle_signal
+        self.scan_thread = None
+
+    def _setup_tray_icon(self):
+        try:
+            from pystray import Icon, Menu, MenuItem
+            from PIL import Image, ImageDraw
+            import threading
+
+            image = Image.new('RGB', (64, 64), 'black')
+            draw = ImageDraw.Draw(image)
+            draw.rectangle([0, 0, 63, 63], outline='green')
+            draw.text((10, 25), "BS", fill='white')
+
+            menu = Menu(
+                MenuItem('Показать', self._show_window),
+                MenuItem('Скрыть', self._hide_window),
+                MenuItem('Выход', self._quit_app)
+            )
+
+            self.tray_icon = Icon("binance_scanner", image, "Binance Scanner", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+        except ImportError:
+            self.log_text.insert(tk.END, "Для работы в трее установите pystray и PIL: pip install pystray Pillow\n")
+
+    def _show_window(self, icon=None, item=None):
+        self.root.after(0, self.root.deiconify)
+        self.background_mode = False
+
+    def _hide_window(self, icon=None, item=None):
+        self.root.withdraw()
+        self.background_mode = True
+        self.log_text.insert(tk.END, "Приложение свернуто в трей. Сигналы >0.5% будут показываться в уведомлениях.\n")
+
+    def _quit_app(self, icon=None, item=None):
+        self._stop_scanning()
+        if hasattr(self, 'tray_icon'):
+            self.tray_icon.stop()
+        self.root.quit()
+
+    def _setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        header = ttk.Frame(main_frame)
+        header.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(header, text="Binance Scanner Pro", font=('Helvetica', 14, 'bold')).pack(side=tk.LEFT)
+
+        self.status_var = tk.StringVar(value="Готов к работе")
+        ttk.Label(header, textvariable=self.status_var, bootstyle=INFO).pack(side=tk.RIGHT)
+
+        notebook = ttk.Notebook(main_frame, bootstyle=PRIMARY)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        scan_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(scan_frame, text="Сканирование")
+
+        settings_frame = ttk.LabelFrame(scan_frame, text="Параметры", padding=10)
+        settings_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(settings_frame, text="Торговые пары:", bootstyle=PRIMARY).grid(row=0, column=0, sticky=tk.W, padx=5)
+        self.symbols_entry = ttk.Entry(settings_frame, width=100, bootstyle=PRIMARY)
+        self.symbols_entry.insert(0, ", ".join(SYMBOLS))
+        self.symbols_entry.grid(row=0, column=1, padx=5, sticky=tk.W)
+
+        ttk.Label(settings_frame, text="Таймфрейм:", bootstyle=PRIMARY).grid(row=1, column=0, sticky=tk.W, padx=5)
+        self.timeframe_combo = ttk.Combobox(settings_frame, values=TIMEFRAMES, state="readonly", bootstyle=PRIMARY)
+        self.timeframe_combo.current(1)
+        self.timeframe_combo.grid(row=1, column=1, sticky=tk.W, padx=5)
+
+        control_frame = ttk.Frame(scan_frame)
+        control_frame.pack(fill=tk.X, pady=10)
+
+        self.start_btn = ttk.Button(control_frame, text="Старт", command=self._start_scanning, bootstyle=SUCCESS)
+        self.stop_btn = ttk.Button(control_frame, text="Стоп", command=self._stop_scanning, state=tk.DISABLED,
+                                   bootstyle=DANGER)
+        self.clear_btn = ttk.Button(control_frame, text="Очистить", command=self._clear_signals, bootstyle=WARNING)
+        self.filter_btn = ttk.Button(control_frame, text="Фильтр", command=self._show_filter_dialog, bootstyle=INFO)
+        self.report_btn = ttk.Button(control_frame, text="Отчет", command=self._generate_report,
+                                     bootstyle=(INFO, OUTLINE))
+        self.tray_btn = ttk.Button(control_frame, text="Скрыть в трей", command=self._hide_window,
+                                   bootstyle=(INFO, OUTLINE))
+
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.clear_btn.pack(side=tk.LEFT, padx=5)
+        self.filter_btn.pack(side=tk.LEFT, padx=5)
+        self.report_btn.pack(side=tk.LEFT, padx=5)
+        self.tray_btn.pack(side=tk.RIGHT, padx=5)
+
+        signals_frame = ttk.LabelFrame(scan_frame, text="Сигналы", padding=10)
+        signals_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = [("time", "Время", 100), ("symbol", "Пара", 80), ("pattern", "Паттерн", 150),
+                   ("strength", "Сила", 60), ("price", "Цена", 100), ("change", "Изм.%", 80),
+                   ("action", "Сигнал", 100), ("tp_sl", "TP/SL", 120)]
+
+        self.signals_table = ttk.Treeview(signals_frame, columns=[c[0] for c in columns], show="headings", height=15)
+        for col_id, col_text, col_width in columns:
+            self.signals_table.heading(col_id, text=col_text)
+            self.signals_table.column(col_id, width=col_width, anchor=tk.CENTER)
+
+        scrollbar = ttk.Scrollbar(signals_frame, orient=tk.VERTICAL, command=self.signals_table.yview)
+        self.signals_table.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.signals_table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.signals_table.tag_configure('buy', foreground='#4CAF50')
+        self.signals_table.tag_configure('sell', foreground='#F44336')
+        self.signals_table.tag_configure('strong', font=('Helvetica', 9, 'bold'))
+
+        log_frame = ttk.LabelFrame(scan_frame, text="Лог", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = tk.Text(log_frame, height=8, wrap=tk.WORD)
+        log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        theme_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(theme_tab, text="Тема")
+
+        theme_frame = ttk.LabelFrame(theme_tab, text="Настройки темы", padding=10)
+        theme_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        ttk.Label(theme_frame, text="Выберите тему:", bootstyle=PRIMARY).pack(anchor=tk.W, pady=5)
+
+        self.theme_combo = ttk.Combobox(
+            theme_frame,
+            values=['darkly', 'solar', 'superhero', 'morph', 'cyborg'],
+            state="readonly",
+            bootstyle=PRIMARY
+        )
+        self.theme_combo.pack(fill=tk.X, pady=5)
+        self.theme_combo.set('darkly')
+
+        ttk.Button(
+            theme_frame,
+            text="Применить тему",
+            command=self._change_theme,
+            bootstyle=SUCCESS
+        ).pack(pady=10)
+
+        bg_tab = ttk.Frame(notebook, padding=10)
+        notebook.add(bg_tab, text="Фоновый режим")
+
+        bg_frame = ttk.LabelFrame(bg_tab, text="Настройки фонового режима", padding=10)
+        bg_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.bg_notify_var = tk.BooleanVar(value=BACKGROUND_SETTINGS['show_notifications'])
+        ttk.Checkbutton(
+            bg_frame,
+            text="Показывать уведомления",
+            variable=self.bg_notify_var,
+            bootstyle="round-toggle"
+        ).pack(anchor=tk.W, pady=5)
+
+        self.bg_sound_var = tk.BooleanVar(value=BACKGROUND_SETTINGS['play_sound'])
+        ttk.Checkbutton(
+            bg_frame,
+            text="Проигрывать звук",
+            variable=self.bg_sound_var,
+            bootstyle="round-toggle"
+        ).pack(anchor=tk.W, pady=5)
+
+        ttk.Label(bg_frame, text="Минимальное изменение цены (%):", bootstyle=PRIMARY).pack(anchor=tk.W, pady=5)
+        self.bg_change_var = tk.DoubleVar(value=BACKGROUND_SETTINGS['min_price_change'])
+        ttk.Entry(
+            bg_frame,
+            textvariable=self.bg_change_var,
+            width=10,
+            bootstyle=PRIMARY
+        ).pack(anchor=tk.W)
+
+        ttk.Button(
+            bg_frame,
+            text="Сохранить настройки",
+            command=self._save_bg_settings,
+            bootstyle=SUCCESS
+        ).pack(pady=10)
+
+    def _clear_signals(self):
+        """Очистка таблицы сигналов"""
+        for item in self.signals_table.get_children():
+            self.signals_table.delete(item)
+        self.log_text.insert(tk.END, "Сигналы очищены\n")
+        self.log_text.see(tk.END)
+
+    def _show_filter_dialog(self):
+        """Диалог фильтрации символов"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Фильтр символов")
+        dialog.geometry("300x400")
+
+        canvas = tk.Canvas(dialog)
+        scrollbar = ttk.Scrollbar(dialog, orient=tk.VERTICAL, command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        for symbol in SYMBOLS:
+            var = tk.BooleanVar(value=symbol in self.selected_symbols)
+            self.symbol_vars[symbol] = var
+            cb = ttk.Checkbutton(scroll_frame, text=symbol, variable=var, bootstyle="round-toggle")
+            cb.pack(anchor=tk.W, padx=5, pady=2)
+
+        btn_frame = ttk.Frame(dialog)
+        ttk.Button(btn_frame, text="Применить", command=lambda: self._apply_filter(dialog), bootstyle=SUCCESS).pack(
+            side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="Сбросить", command=lambda: self._reset_filter(dialog), bootstyle=DANGER).pack(
+            side=tk.RIGHT, padx=10)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        btn_frame.pack(fill=tk.X, pady=10)
+
+    def _apply_filter(self, dialog):
+        """Применение фильтра"""
+        self.selected_symbols = {s for s, var in self.symbol_vars.items() if var.get()}
+        self._clear_signals()
+        dialog.destroy()
+
+    def _reset_filter(self, dialog):
+        """Сброс фильтра"""
+        for var in self.symbol_vars.values():
+            var.set(False)
+        self.selected_symbols = set()
+        self._clear_signals()
+        dialog.destroy()
+
+    def _change_theme(self):
+        """Изменение темы интерфейса"""
+        theme = self.theme_combo.get()
+        self.style.theme_use(theme)
+        self.log_text.insert(tk.END, f"Тема изменена на: {theme}\n")
+        self.log_text.see(tk.END)
+
+    def _save_bg_settings(self):
+        """Сохранение настроек фонового режима"""
+        BACKGROUND_SETTINGS['show_notifications'] = self.bg_notify_var.get()
+        BACKGROUND_SETTINGS['play_sound'] = self.bg_sound_var.get()
+        BACKGROUND_SETTINGS['min_price_change'] = self.bg_change_var.get()
+        self.log_text.insert(tk.END, "Настройки фонового режима сохранены\n")
+        self.log_text.see(tk.END)
+
+    def _center_window(self):
+        """Центрирование окна"""
+        self.root.update_idletasks()
+        w = self.root.winfo_width()
+        h = self.root.winfo_height()
+        x = (self.root.winfo_screenwidth() // 2) - (w // 2)
+        y = (self.root.winfo_screenheight() // 2) - (h // 2)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _setup_bindings(self):
+        """Настройка горячих клавиш"""
+        self.root.bind("<Control-c>", lambda e: self._clear_signals())
+        self.root.bind("<Control-f>", lambda e: self._show_filter_dialog())
+        self.root.bind("<Control-r>", lambda e: self._generate_report())
+        self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
+
+    def _handle_signal(self, signal_data):
+        """Обработчик сигналов для отображения в GUI"""
+        try:
+            # Проверяем фильтр символов
+            if self.selected_symbols and signal_data['symbol'] not in self.selected_symbols:
+                return
+
+            # Добавляем в отчет
+            self.report_generator.add_signal(signal_data)
+
+            # Определяем тип сигнала
+            is_buy = signal_data['action'] == 'BUY'
+            is_strong = signal_data['strength'] >= 3
+
+            # В фоновом режиме показываем уведомления
+            if self.background_mode and BACKGROUND_SETTINGS['show_notifications']:
+                try:
+                    notification.notify(
+                        title=f"{signal_data['symbol']} {'🟢 Купить' if is_buy else '🔴 Продать'}",
+                        message=f"Сила: {signal_data['strength']} | Изм: {signal_data['change']}%",
+                        timeout=10
+                    )
+                except Exception as e:
+                    self.log_text.insert(tk.END, f"Ошибка уведомления: {str(e)}\n")
+                return
+
+            # Отображение в таблице
+            action_text = "🟢 Купить" if is_buy else "🔴 Продать"
+            tags = ('buy' if is_buy else 'sell',)
+            if is_strong:
+                tags += ('strong',)
+
+            self.signals_table.insert("", tk.END,
+                                      values=(
+                                          signal_data['time'],
+                                          signal_data['symbol'],
+                                          signal_data['pattern'],
+                                          '★' * signal_data['strength'],
+                                          f"{signal_data['price']:.4f}",
+                                          f"{signal_data['change']:+.2f}%",
+                                          action_text,
+                                          f"TP: {signal_data['tp']:.4f} | SL: {signal_data['sl']:.4f}"
+                                      ),
+                                      tags=tags
+                                      )
+
+            # Автоскролл
+            if UI_SETTINGS['auto_scroll']:
+                self.signals_table.see(tk.END)
+                self.log_text.see(tk.END)
+
+            # Ограничение количества сигналов
+            if len(self.signals_table.get_children()) > UI_SETTINGS['max_signals']:
+                self.signals_table.delete(self.signals_table.get_children()[0])
+
+        except Exception as e:
+            self.log_text.insert(tk.END, f"Ошибка обработки сигнала: {str(e)}\n")
+
+    def _start_scanning(self):
+        try:
+            symbols_text = self.symbols_entry.get()
+            if not symbols_text.strip():
+                messagebox.showwarning("Ошибка", "Укажите торговые пары")
+                return
+
+            symbols = [s.strip().upper() for s in symbols_text.split(",") if s.strip()]
+            selected_timeframe = self.timeframe_combo.get()
+
+            # Проверка подключения
+            try:
+                self.scanner.exchange.fetch_ticker('BTC/USDT')
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Нет подключения к Binance: {str(e)}")
+                return
+
+            # Обновляем настройки для выбранного таймфрейма
+            self.scanner.update_timeframe_settings(selected_timeframe)
+            self.report_generator.set_scanning_params(selected_timeframe, symbols)
+
+            # Очищаем предыдущие сигналы
+            self._clear_signals()
+
+            # Обновляем интерфейс
+            self.status_var.set(f"Сканирование {selected_timeframe}...")
+            self.log_text.insert(tk.END, f"Запуск сканирования {len(symbols)} пар на {selected_timeframe}...\n")
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+
+            # Запускаем сканирование в отдельном потоке
+            self.scan_thread = Thread(
+                target=self.scanner.start_scanning,
+                args=(symbols, selected_timeframe),
+                daemon=True
+            )
+            self.scan_thread.start()
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось начать сканирование: {str(e)}")
+            self.log_text.insert(tk.END, f"Ошибка: {str(e)}\n")
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+
+    def _stop_scanning(self):
+        """Остановка сканирования"""
+        self.scanner.stop()
+        self.start_btn.config(state=tk.NORMAL)
+        self.stop_btn.config(state=tk.DISABLED)
+        self.status_var.set("Готов к работе")
+        self.log_text.insert(tk.END, "Сканирование остановлено\n")
+        self.log_text.see(tk.END)
+
+    def _generate_report(self):
+        """Генерация отчета"""
+        try:
+            if not self.report_generator.report_data['signals']:
+                messagebox.showwarning("Предупреждение", "Нет данных для генерации отчета")
+                return
+
+            default_filename = f"Binance_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            filename = filedialog.asksaveasfilename(
+                initialfile=default_filename,
+                defaultextension=".pdf",
+                filetypes=[("PDF files", "*.pdf")]
+            )
+
+            if filename:
+                report_path = self.report_generator.generate_pdf_report(filename)
+                self.log_text.insert(tk.END, f"Отчет сохранен: {report_path}\n")
+                self.log_text.see(tk.END)
+
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось создать отчет: {str(e)}")
+            self.log_text.insert(tk.END, f"Ошибка: {str(e)}\n")
+            self.log_text.see(tk.END)
+
+
+if __name__ == "__main__":
+    root = ttk.Window(themename="darkly")
+    app = BinanceScannerApp(root)
+    root.mainloop()
