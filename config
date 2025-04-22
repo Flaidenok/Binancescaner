@@ -1,0 +1,60 @@
+setting.php
+
+  # Binance API credentials
+BINANCE_API = {
+    'api_key': 'ваш api',
+    'secret': 'ваш секретный ключ'
+}
+
+SYMBOLS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
+    'DOGE/USDT', 'AVAX/USDT', 'LINK/USDT', 'DOT/USDT',
+    'BNB/USDT', 'ATOM/USDT', 'LTC/USDT', 'UNI/USDT', 'FIL/USDT',
+    'XLM/USDT', 'ETC/USDT', 'ALGO/USDT', 'AAVE/USDT', 'AXS/USDT'
+]
+
+TIMEFRAMES = ['3m', '5m', '15m']
+
+TIMEFRAME_SETTINGS = {
+    '3m': {
+        'min_price_change': 0.05,  # Более чувствительные настройки
+        'min_volume_ratio': 1.0,    # Убрал жесткое ограничение по объему
+        'min_strength': 1,
+        'tp_multiplier': 1.008,     # Более агрессивные TP/SL
+        'sl_multiplier': 0.995
+    },
+     '5m': {
+        'min_price_change': 0.1,  # 0.1%
+        'min_volume_ratio': 1.1,  # +10% объёма
+        'min_strength': 2,
+        'tp_multiplier': 1.01,    # TP 1%
+        'sl_multiplier': 0.99     # SL 1%
+    },
+    '15m': {
+        'min_price_change': 0.2,     # Более чувствительные настройки
+        'min_volume_ratio': 1.2,
+        'min_strength': 2,
+        'tp_multiplier': 1.018,      # Более агрессивные TP/SL
+        'sl_multiplier': 0.982
+    }
+}
+
+SIGNAL_FILTERS = TIMEFRAME_SETTINGS['5m']
+
+NOTIFICATIONS = {
+    'enable_desktop': True,
+    'enable_sound': True,
+    'show_strength': True
+}
+
+UI_SETTINGS = {
+    'max_signals': 200,
+    'auto_scroll': True,
+    'default_filter': []
+}
+
+BACKGROUND_SETTINGS = {
+    'min_price_change': 0.5,
+    'show_notifications': True,
+    'play_sound': True
+}
